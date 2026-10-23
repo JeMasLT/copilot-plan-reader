@@ -67,7 +67,8 @@ async function piperVoices() {
     const voices = files.map((f) => {
         const name = f.replace(/\.onnx$/, "");
         const m = name.match(/^([a-z]{2,3})_([A-Z]{2})-([^-]+)-(.+)$/);
-        return { name, locale: m ? `${m[1]}-${m[2]}` : "", label: m ? m[3][0].toUpperCase() + m[3].slice(1) : name, quality: m?.[4] };
+        const PRETTY = { ingute: "Ingutė", reginute1: "Reginutė" };
+        return { name, locale: m ? `${m[1]}-${m[2]}` : "", label: m ? PRETTY[m[3]] || m[3][0].toUpperCase() + m[3].slice(1) : name, quality: m?.[4] };
     });
     if (!voices.length) return { available: false, reason: `No Piper voices in ${PIPER_DIR}`, voices };
     const py = await findPython();

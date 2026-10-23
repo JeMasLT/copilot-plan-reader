@@ -7,7 +7,7 @@ Renders a markdown file (default: the current session's `plan.md`) in a side pan
 - Speed 0.5–2x, optional skipping of code blocks, auto-reload when the file changes
 - Voices (English US/UK and Lithuanian only):
   - **Windows voices**, offline, built in, no setup needed
-  - **Piper**, offline natural voices (Lessac US, Alba UK), needs `setup.ps1`
+  - **Piper**, offline natural voices: Lessac (US), Alba (UK), **Ingutė and Reginutė (Lithuanian)**. Needs `setup.ps1`.
   - **Edge online voices**, natural (Lithuanian Ona/Leonas plus US/UK English), needs `setup.ps1`. The text is sent to Microsoft's read-aloud service.
 - Agent actions: `load { path }`, `play`, `stop`
 
@@ -20,7 +20,17 @@ powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.copilot\extensions\p
 
 Then restart the GitHub Copilot app and ask it to "open plan reader".
 
-`setup.ps1` requires Python 3. It runs `pip install edge-tts piper-tts` and downloads the Piper voices (about 63 MB each) into `artifacts/piper-voices/`. That folder isn't committed to git. Without the setup, only Windows voices are available. Use `-SkipOnline` or `-SkipOffline` to install just one engine.
+`setup.ps1` requires Python 3. It runs `pip install edge-tts piper-tts` and downloads the four Piper voices (about 63 MB each) into `artifacts/piper-voices/`. That folder isn't committed to git. Without the setup, only Windows voices are available. Use `-SkipOnline` or `-SkipOffline` to install just one engine.
+
+### Lithuanian offline voices
+
+Piper 1.8.0 can't phonemize Lithuanian on its own, so `setup.ps1` also downloads the voice author's phonemizer and wrapper ([RobertasTa/lt_LT-ingute-medium](https://huggingface.co/RobertasTa/lt_LT-ingute-medium)) into `artifacts/piper-lt/`, and `piper_worker.py` runs Lithuanian voices through it. Credits and licences:
+
+- Ingutė (`lt_LT-ingute-medium`), Robertas & Claude, grown from Reginutė. Voice licence: NewGenLTU Open RAIL-D 1.0 (`artifacts/piper-lt/LICENSE-VOICE-ingute`).
+- Reginutė (`lt_LT-reginute1-medium`), trained on the LIEPA corpus of Vilnius University. CC BY 4.0.
+- Phonemizer code: GPL-3.0 (`artifacts/piper-lt/LICENSE`).
+
+If you publish audio made with these voices, disclose that it's machine-generated (required by Ingutė's licence).
 
 To add more offline voices, put any `.onnx` and `.onnx.json` pair from the [Piper voice catalog](https://huggingface.co/rhasspy/piper-voices) (en_US, en_GB or lt_LT) into `artifacts/piper-voices/`.
 
