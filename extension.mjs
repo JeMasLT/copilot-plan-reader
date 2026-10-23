@@ -272,28 +272,64 @@ async function addRecent(p) {
     } catch {}
 }
 
-// Native Windows "Open file" dialog, shown on top of the app.
+// Native Windows "Open file" dialog. A PowerShell host with WinForms already loaded is
+// kept warm in the background, so a click only has to show the dialog (no startup cost).
 const BROWSE_PS = `
 Add-Type -AssemblyName System.Windows.Forms
-$owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false; WindowState = 'Minimized' }
-$d = New-Object System.Windows.Forms.OpenFileDialog
-$d.Title = 'Open markdown file in Plan Reader'
-$d.Filter = 'Markdown (*.md;*.markdown)|*.md;*.markdown|Text (*.txt)|*.txt|All files (*.*)|*.*'
-if ($env:PR_INITIAL_DIR -and (Test-Path -LiteralPath $env:PR_INITIAL_DIR)) { $d.InitialDirectory = $env:PR_INITIAL_DIR }
-if ($d.ShowDialog($owner) -eq 'OK') { [Console]::OutputEncoding = [Text.Encoding]::UTF8; [Console]::Out.Write($d.FileName) }
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$in = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), [Text.Encoding]::UTF8)
+$warm = New-Object System.Windows.Forms.OpenFileDialog; $warm.Dispose()
+[Console]::Out.WriteLine('READY'); [Console]::Out.Flush()
+while ($null -ne ($line = $in.ReadLine())) {
+    $dir = $line.Trim()
+    $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false; StartPosition = 'CenterScreen'; Size = '1,1'; Opacity = 0 }
+    $owner.Show(); $owner.Activate()
+    $d = New-Object System.Windows.Forms.OpenFileDialog
+    $d.Title = 'Open markdown file in Plan Reader'
+    $d.Filter = 'Markdown (*.md;*.markdown)|*.md;*.markdown|Text (*.txt)|*.txt|All files (*.*)|*.*'
+    if ($dir -and (Test-Path -LiteralPath $dir)) { $d.InitialDirectory = $dir }
+    $r = if ($d.ShowDialog($owner) -eq 'OK') { $d.FileName } else { '' }
+    $d.Dispose(); $owner.Close(); $owner.Dispose()
+    [Console]::Out.WriteLine('RESULT:' + $r); [Console]::Out.Flush()
+}
 `;
+let dialogHost = null; // { proc, ready: Promise, waiting: resolve fn | null, dead }
+function getDialogHost() {
+    if (dialogHost && !dialogHost.dead) return dialogHost;
+    const proc = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass",
+        "-EncodedCommand", Buffer.from(BROWSE_PS, "utf16le").toString("base64")], { windowsHide: true });
+    const h = { proc, waiting: null, dead: false };
+    let buf = "", readyFn;
+    h.ready = new Promise((r) => (readyFn = r));
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (d) => {
+        buf += d;
+        let i;
+        while ((i = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, i).replace(/\r$/, "");
+            buf = buf.slice(i + 1);
+            if (line === "READY") readyFn(true);
+            else if (line.startsWith("RESULT:") && h.waiting) { const w = h.waiting; h.waiting = null; w(line.slice(7) || null); }
+        }
+    });
+    const die = () => { h.dead = true; readyFn(false); if (h.waiting) { const w = h.waiting; h.waiting = null; w(null); } };
+    proc.on("error", die);
+    proc.on("exit", die);
+    dialogHost = h;
+    return h;
+}
+
 let browsing = null;
 function browseForFile(initialDir) {
     if (browsing) return browsing;
-    browsing = new Promise((res) => {
-        const p = spawn("powershell.exe", ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-EncodedCommand",
-            Buffer.from(BROWSE_PS, "utf16le").toString("base64")],
-            { windowsHide: false, env: { ...process.env, PR_INITIAL_DIR: initialDir || "" } });
-        let out = "";
-        p.stdout.on("data", (d) => (out += d));
-        p.on("error", () => res(null));
-        p.on("close", () => res(out.trim() || null));
-    }).finally(() => { browsing = null; });
+    browsing = (async () => {
+        const h = getDialogHost();
+        if (!(await h.ready)) return null;
+        const result = new Promise((r) => (h.waiting = r));
+        h.proc.stdin.write((initialDir || "") + "\n");
+        return result;
+    })().finally(() => { browsing = null; });
     return browsing;
 }
 
@@ -313,6 +349,7 @@ async function startServer(entry) {
         const url = new URL(req.url, "http://127.0.0.1");
         try {
             if (url.pathname === "/") {
+                if (process.platform === "win32") getDialogHost();
                 res.setHeader("Content-Type", "text/html; charset=utf-8");
                 res.end(await readFile(join(HERE, "ui.html"), "utf8"));
             } else if (url.pathname === "/file") {
@@ -479,4 +516,4 @@ const canvas = createCanvas({
 });
 
 await joinSession({ canvases: [canvas] });
-process.on("exit", () => { try { piper?.proc.kill(); } catch {} });
+process.on("exit", () => { try { piper?.proc.kill(); } catch {} try { dialogHost?.proc.kill(); } catch {} });
