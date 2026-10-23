@@ -1,0 +1,456 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Plan Reader</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0;
+    background: var(--background-color-default, #fff);
+    color: var(--text-color-default, #1f2328);
+    font-family: var(--font-sans, -apple-system, "Segoe UI", sans-serif);
+    font-size: var(--text-body-medium, 14px);
+    line-height: 1.6;
+  }
+  #bar {
+    position: sticky; top: 0; z-index: 2;
+    display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    padding: 8px 12px;
+    background: var(--background-color-default, #fff);
+    border-bottom: 1px solid var(--border-color-default, #d0d7de);
+  }
+  button, select, input[type=text] {
+    font: inherit; color: inherit;
+    background: transparent;
+    border: 1px solid var(--border-color-default, #d0d7de);
+    border-radius: 6px; padding: 3px 9px;
+  }
+  button { cursor: pointer; }
+  button:hover { background: color-mix(in srgb, currentColor 8%, transparent); }
+  button.primary { font-weight: 600; }
+  select { max-width: 230px; }
+  select option { color: #000; }
+  label { display: flex; align-items: center; gap: 4px; color: var(--text-color-muted, #656d76); }
+  #path { flex: 1 1 260px; min-width: 160px; font-size: 12px; }
+  #status { font-size: 12px; color: var(--text-color-muted, #656d76); width: 100%; }
+  #doc { padding: 4px 20px 60vh; max-width: 900px; }
+  [data-i] { cursor: pointer; border-radius: 4px; transition: background .15s; }
+  [data-i]:hover { background: color-mix(in srgb, currentColor 5%, transparent); }
+  .reading { background: color-mix(in srgb, var(--true-color-blue, #0969da) 22%, transparent) !important;
+             outline: 2px solid color-mix(in srgb, var(--true-color-blue, #0969da) 45%, transparent); }
+  code { font-family: var(--font-mono, Consolas, monospace); font-size: 12px;
+         background: color-mix(in srgb, currentColor 8%, transparent); padding: 1px 4px; border-radius: 4px; }
+  pre { background: color-mix(in srgb, currentColor 6%, transparent); padding: 10px; border-radius: 6px; overflow: auto; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; }
+  td, th { border: 1px solid var(--border-color-default, #d0d7de); padding: 3px 8px; }
+  blockquote { margin: 0; padding-left: 12px; border-left: 3px solid var(--border-color-default, #d0d7de); color: var(--text-color-muted, #656d76); }
+  a { color: var(--true-color-blue, #0969da); }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="play" class="primary" title="Play / Pause (Space)">▶ Play</button>
+  <button id="stop" title="Stop (Esc)">■ Stop</button>
+  <button id="prev" title="Previous block">⏮</button>
+  <button id="next" title="Next block">⏭</button>
+  <label>Voice <select id="voice"></select></label><span id="voiceNote" style="font-size:12px;color:var(--text-color-muted,#656d76)"></span>
+  <label>Speed <input id="rate" type="range" min="0.5" max="2" step="0.1" value="1"><span id="rateVal">1.0x</span></label>
+  <label><input id="skipCode" type="checkbox" checked> Skip code</label>
+  <input id="path" type="text" placeholder="Path to .md file" spellcheck="false">
+  <button id="open" title="Load this path">Open</button>
+  <button id="reload" title="Reload file">⟳</button>
+  <div id="status"></div>
+</div>
+<div id="doc"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const synth = window.speechSynthesis;
+let blocks = [];      // { el, text }
+let cur = -1;
+let state = "idle";   // idle | playing | paused
+let runId = 0;
+let lastContent = null;
+
+// ---------- Markdown ----------
+function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function inline(s) {
+  s = esc(s);
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  return s;
+}
+function speakable(s) {
+  return s
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/(\*\*|__|\*|_|~~)/g, "")
+    .replace(/^#+\s*/, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\s*\|\s*/g, ", ")
+    .replace(/[→⇒]/g, ", ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function render(md) {
+  const doc = $("doc");
+  doc.innerHTML = "";
+  blocks = [];
+  const lines = md.replace(/\r\n?/g, "\n").split("\n");
+  let i = 0, listEl = null, listType = null;
+  const add = (el, text, isCode) => {
+    if (text && text.trim()) { el.dataset.i = blocks.length; blocks.push({ el, text, isCode }); }
+    return el;
+  };
+  const closeList = () => { listEl = null; listType = null; };
+
+  while (i < lines.length) {
+    let line = lines[i];
+    if (/^\s*$/.test(line)) { closeList(); i++; continue; }
+
+    let m;
+    if ((m = line.match(/^\s*(```|~~~)(.*)$/))) {
+      closeList();
+      const fence = m[1], body = [];
+      i++;
+      while (i < lines.length && !lines[i].trim().startsWith(fence)) body.push(lines[i++]);
+      i++;
+      const pre = document.createElement("pre");
+      pre.innerHTML = "<code>" + esc(body.join("\n")) + "</code>";
+      doc.appendChild(add(pre, body.join(" "), true));
+      continue;
+    }
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      closeList();
+      const h = document.createElement("h" + m[1].length);
+      h.innerHTML = inline(m[2]);
+      doc.appendChild(add(h, speakable(m[2])));
+      i++; continue;
+    }
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      closeList(); doc.appendChild(document.createElement("hr")); i++; continue;
+    }
+    if (/^\s*\|/.test(line)) {
+      closeList();
+      const table = document.createElement("table");
+      while (i < lines.length && /^\s*\|/.test(lines[i])) {
+        const row = lines[i++].trim();
+        if (/^\|[\s:|-]+\|?$/.test(row)) continue;
+        const cells = row.replace(/^\||\|$/g, "").split("|");
+        const tr = document.createElement("tr");
+        cells.forEach((c) => { const td = document.createElement("td"); td.innerHTML = inline(c.trim()); tr.appendChild(td); });
+        table.appendChild(tr);
+        add(tr, speakable(cells.join(" | ")));
+      }
+      doc.appendChild(table);
+      continue;
+    }
+    if ((m = line.match(/^\s*>\s?(.*)$/))) {
+      closeList();
+      const body = [];
+      while (i < lines.length && (m = lines[i].match(/^\s*>\s?(.*)$/))) { body.push(m[1]); i++; }
+      const bq = document.createElement("blockquote");
+      bq.innerHTML = inline(body.join(" "));
+      doc.appendChild(add(bq, speakable(body.join(" "))));
+      continue;
+    }
+    if ((m = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/))) {
+      const type = /\d/.test(m[2]) ? "ol" : "ul";
+      if (!listEl || listType !== type) {
+        listEl = document.createElement(type); listType = type; doc.appendChild(listEl);
+      }
+      let text = m[3].replace(/^\[( |x|X)\]\s+/, "");
+      i++;
+      while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !/^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) text += " " + lines[i++].trim();
+      const li = document.createElement("li");
+      if (m[1].length >= 2) li.style.marginLeft = (m[1].length * 8) + "px";
+      li.innerHTML = inline(text);
+      listEl.appendChild(add(li, speakable(text)));
+      continue;
+    }
+    closeList();
+    const body = [line.trim()];
+    i++;
+    while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|\s*([-*+]|\d+[.)])\s|\s*```|\s*>|\s*\|)/.test(lines[i])) body.push(lines[i++].trim());
+    const p = document.createElement("p");
+    p.innerHTML = inline(body.join(" "));
+    doc.appendChild(add(p, speakable(body.join(" "))));
+  }
+}
+
+// ---------- Speech ----------
+// Voice option values: "local:<voiceURI>" (Windows), "piper:<model>" (offline natural), "edge:<ShortName>" (online natural)
+const LOCALES = ["en-US", "en-GB", "lt-LT"];
+let onlineVoices = [];
+let piperVoiceList = [];
+let voiceInfo = "";
+const player = new Audio();
+const audioMemo = new Map(); // voice|text -> Promise<objectURL>
+
+function localVoices() { return synth.getVoices(); }
+function selection() {
+  const v = $("voice").value || "";
+  const i = v.indexOf(":");
+  return { engine: v.slice(0, i), id: v.slice(i + 1) };
+}
+function usesAudio(engine) { return engine === "edge" || engine === "piper"; }
+function selectedLocalVoice() {
+  const s = selection();
+  return s.engine === "local" ? localVoices().find((v) => v.voiceURI === s.id) || null : null;
+}
+
+function addGroup(sel, label, items) {
+  if (!items.length) return;
+  const g = document.createElement("optgroup");
+  g.label = label;
+  items.forEach(([value, text]) => {
+    const o = document.createElement("option");
+    o.value = value; o.textContent = text; g.appendChild(o);
+  });
+  sel.appendChild(g);
+}
+
+function fillVoices() {
+  const sel = $("voice");
+  const prev = sel.value;
+  const saved = localStorage.getItem("pr.voice");
+  sel.innerHTML = "";
+  const lang = (l) => l.replace("_", "-");
+  const order = (l) => { const i = LOCALES.indexOf(l); return i < 0 ? 99 : i; };
+  const lv = localVoices().filter((v) => LOCALES.includes(lang(v.lang)))
+    .sort((a, b) => order(lang(a.lang)) - order(lang(b.lang)) || a.name.localeCompare(b.name));
+  const pv = piperVoiceList.slice().sort((a, b) => order(a.locale) - order(b.locale) || a.label.localeCompare(b.label));
+  addGroup(sel, "Offline natural (Piper)", pv.map((v) => ["piper:" + v.name, `${v.label} (${v.locale})`]));
+  addGroup(sel, "Windows voices (offline)", lv.map((v) => ["local:" + v.voiceURI, `${v.name.replace(/^Microsoft /, "").replace(/ - .*$/, "")} (${lang(v.lang)})`]));
+  const ov = onlineVoices.slice().sort((a, b) => order(a.locale) - order(b.locale) || a.name.localeCompare(b.name));
+  const label = (v) => `${v.name.replace(/^[a-z]+-[A-Z]+-/, "").replace(/Neural$/, "")} · ${v.gender === "Female" ? "♀" : "♂"}`;
+  const tag = " — online, text sent to Microsoft";
+  addGroup(sel, "Online · Lithuanian" + tag, ov.filter((v) => v.locale === "lt-LT").map((v) => ["edge:" + v.name, label(v)]));
+  addGroup(sel, "Online · English (US)" + tag, ov.filter((v) => v.locale === "en-US").map((v) => ["edge:" + v.name, label(v)]));
+  addGroup(sel, "Online · English (UK)" + tag, ov.filter((v) => v.locale === "en-GB").map((v) => ["edge:" + v.name, label(v)]));
+  const has = (v) => v && [...sel.options].some((o) => o.value === v);
+  const legacy = saved && !saved.includes(":") ? "local:" + saved : saved;
+  if (has(legacy)) sel.value = legacy;
+  else if (has(prev) && !(prev.startsWith("local:") && pv.length)) sel.value = prev;
+  else {
+    const p = pv.find((v) => v.locale === "en-US") || pv[0];
+    const d = lv.find((v) => v.default) || lv[0];
+    if (p) sel.value = "piper:" + p.name;
+    else if (d) sel.value = "local:" + d.voiceURI;
+  }
+  updateVoiceNote();
+}
+
+function updateVoiceNote() {
+  const s = selection();
+  if (s.engine === "piper") fetch("/warm", { method: "POST", body: JSON.stringify({ voice: s.engine + ":" + s.id }) }).catch(() => {});
+  const note = s.engine === "edge" ? "🌐 online" : s.engine === "piper" ? "💻 offline natural" : "";
+  $("voiceNote").textContent = [note, voiceInfo].filter(Boolean).join(" · ");
+  $("voiceNote").title = s.engine === "edge"
+    ? "Uses Microsoft Edge's online read-aloud service: text is sent to Microsoft to generate audio."
+    : s.engine === "piper" ? "Piper neural voice, generated locally on this PC." : voiceInfo;
+}
+
+async function loadExtraVoices() {
+  const notes = [];
+  try {
+    const r = await (await fetch("/voices")).json();
+    if (r.piper.available) piperVoiceList = r.piper.voices; else notes.push("Offline natural unavailable: " + r.piper.reason);
+    if (r.edge.available) onlineVoices = r.edge.voices; else notes.push("Online unavailable: " + r.edge.reason);
+  } catch (e) { notes.push("Extra voices unavailable"); }
+  voiceInfo = notes.join(" · ");
+  fillVoices();
+}
+
+function splitText(t, max) {
+  if (t.length <= max) return [t];
+  const parts = t.match(/[^.!?;:]+[.!?;:]*\s*/g) || [t];
+  const out = []; let buf = "";
+  for (const p of parts) {
+    if ((buf + p).length > max && buf) { out.push(buf); buf = ""; }
+    buf += p;
+  }
+  if (buf.trim()) out.push(buf);
+  return out;
+}
+
+function highlight(i) {
+  document.querySelectorAll(".reading").forEach((e) => e.classList.remove("reading"));
+  if (i >= 0 && blocks[i]) {
+    blocks[i].el.classList.add("reading");
+    blocks[i].el.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+}
+
+function setState(s) {
+  state = s;
+  $("play").textContent = s === "playing" ? "⏸ Pause" : s === "paused" ? "▶ Resume" : "▶ Play";
+  status();
+}
+
+function status(extra) {
+  const pos = cur >= 0 ? `Block ${cur + 1}/${blocks.length}` : `${blocks.length} blocks`;
+  $("status").textContent = [extra, pos, state !== "idle" ? state : ""].filter(Boolean).join(" · ");
+}
+
+function blockText(idx) { const b = blocks[idx]; return b.isCode ? "Code block." : b.text; }
+function nextIndex(idx) {
+  while (idx < blocks.length && $("skipCode").checked && blocks[idx].isCode) idx++;
+  return idx;
+}
+
+function fetchAudio(voice, text) {
+  const key = voice + "|" + text;
+  if (!audioMemo.has(key)) {
+    const p = fetch("/tts", { method: "POST", body: JSON.stringify({ voice, text }) })
+      .then(async (r) => {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "HTTP " + r.status);
+        return URL.createObjectURL(await r.blob());
+      });
+    p.catch(() => audioMemo.delete(key));
+    audioMemo.set(key, p);
+    if (audioMemo.size > 60) audioMemo.delete(audioMemo.keys().next().value);
+  }
+  return audioMemo.get(key);
+}
+
+function speakFrom(i) {
+  synth.cancel(); player.pause();
+  const my = ++runId;
+  const sel = selection();
+  const audio = usesAudio(sel.engine);
+  const vid = sel.engine + ":" + sel.id;
+  const max = sel.engine === "edge" ? 600 : sel.engine === "piper" ? 350 : 220;
+  const step = (idx) => {
+    if (my !== runId) return;
+    idx = nextIndex(idx);
+    if (idx >= blocks.length) { cur = -1; highlight(-1); setState("idle"); return; }
+    cur = idx; highlight(idx); status();
+    const chunks = splitText(blockText(idx), max);
+    if (audio) {
+      const ni = nextIndex(idx + 1);
+      if (ni < blocks.length) fetchAudio(vid, splitText(blockText(ni), max)[0]);
+    }
+    let k = 0;
+    const next = async () => {
+      if (my !== runId) return;
+      if (k >= chunks.length) { step(idx + 1); return; }
+      const text = chunks[k++];
+      if (audio) {
+        if (k < chunks.length) fetchAudio(vid, chunks[k]);
+        let url;
+        try { url = await fetchAudio(vid, text); }
+        catch (e) { if (my === runId) { stop(); status("Voice error: " + e.message); } return; }
+        if (my !== runId) return;
+        player.src = url;
+        player.playbackRate = parseFloat($("rate").value);
+        player.onended = next;
+        player.onerror = () => { if (my === runId) next(); };
+        if (state === "playing") player.play().catch(() => {});
+      } else {
+        const u = new SpeechSynthesisUtterance(text);
+        const v = selectedLocalVoice();
+        if (v) { u.voice = v; u.lang = v.lang; }
+        u.rate = parseFloat($("rate").value);
+        u.onend = next;
+        u.onerror = (e) => { if (e.error !== "interrupted" && e.error !== "canceled") { status("Error: " + e.error); next(); } };
+        synth.speak(u);
+      }
+    };
+    next();
+  };
+  setState("playing");
+  step(Math.max(0, i));
+}
+
+function stop() { runId++; synth.cancel(); player.pause(); cur = -1; highlight(-1); setState("idle"); }
+function togglePlay() {
+  const edge = usesAudio(selection().engine);
+  if (state === "playing") { edge ? player.pause() : synth.pause(); setState("paused"); }
+  else if (state === "paused") { setState("playing"); edge ? player.play().catch(() => {}) : synth.resume(); }
+  else speakFrom(cur >= 0 ? cur : 0);
+}
+function jump(d) {
+  const target = Math.min(Math.max((cur < 0 ? 0 : cur) + d, 0), blocks.length - 1);
+  speakFrom(target);
+}
+
+// ---------- File ----------
+async function load(keepPos) {
+  const r = await fetch("/file", { cache: "no-store" });
+  const f = await r.json();
+  $("path").value = f.path;
+  if (!f.exists) { $("doc").innerHTML = "<p><em>File not found: " + esc(f.path) + "</em></p>"; blocks = []; status(); return; }
+  if (f.content === lastContent && keepPos) return;
+  lastContent = f.content;
+  const wasPlaying = state !== "idle";
+  if (wasPlaying) stop();
+  render(f.content);
+  status("Loaded " + f.path.split(/[\\/]/).pop());
+}
+
+// ---------- Wiring ----------
+$("play").onclick = togglePlay;
+$("stop").onclick = stop;
+$("prev").onclick = () => jump(-1);
+$("next").onclick = () => jump(1);
+$("reload").onclick = () => { lastContent = null; load(); };
+$("open").onclick = async () => {
+  const r = await fetch("/load", { method: "POST", body: JSON.stringify({ path: $("path").value.trim().replace(/^"|"$/g, "") }) });
+  const j = await r.json();
+  if (j.error) { status("Error: " + j.error); return; }
+  stop(); lastContent = null; load();
+};
+$("path").addEventListener("keydown", (e) => { if (e.key === "Enter") $("open").click(); });
+$("voice").onchange = () => {
+  localStorage.setItem("pr.voice", $("voice").value);
+  updateVoiceNote();
+  if (state !== "idle") speakFrom(cur);
+};
+$("rate").value = localStorage.getItem("pr.rate") || "1";
+$("rateVal").textContent = parseFloat($("rate").value).toFixed(1) + "x";
+$("rate").oninput = () => {
+  $("rateVal").textContent = parseFloat($("rate").value).toFixed(1) + "x";
+  localStorage.setItem("pr.rate", $("rate").value);
+  player.playbackRate = parseFloat($("rate").value);
+};
+$("rate").onchange = () => { if (state === "playing" && !usesAudio(selection().engine)) speakFrom(cur); };
+$("skipCode").checked = localStorage.getItem("pr.skipCode") !== "0";
+$("skipCode").onchange = () => localStorage.setItem("pr.skipCode", $("skipCode").checked ? "1" : "0");
+$("doc").addEventListener("click", (e) => {
+  if (e.target.closest("a")) return;
+  const el = e.target.closest("[data-i]");
+  if (el) speakFrom(parseInt(el.dataset.i, 10));
+});
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" && e.target.type === "text") return;
+  if (e.code === "Space") { e.preventDefault(); togglePlay(); }
+  else if (e.key === "Escape") stop();
+  else if (e.key === "ArrowDown" || e.key === "ArrowRight") { e.preventDefault(); jump(1); }
+  else if (e.key === "ArrowUp" || e.key === "ArrowLeft") { e.preventDefault(); jump(-1); }
+});
+
+fillVoices();
+if (speechSynthesis.onvoiceschanged !== undefined) speechSynthesis.onvoiceschanged = fillVoices;
+loadExtraVoices();
+
+const es = new EventSource("/events");
+es.onmessage = (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.type === "reload") { stop(); lastContent = null; load(); }
+  else if (m.type === "play") { if (state !== "playing") togglePlay(); }
+  else if (m.type === "stop") stop();
+};
+
+// Auto-refresh when the file changes on disk (idle only)
+setInterval(() => { if (state === "idle") load(true); }, 3000);
+load();
+</script>
+</body>
+</html>
