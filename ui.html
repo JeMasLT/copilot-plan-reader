@@ -32,6 +32,7 @@
   select { max-width: 230px; }
   select option { color: #000; }
   label { display: flex; align-items: center; gap: 4px; color: var(--text-color-muted, #656d76); }
+  #files { max-width: 260px; }
   #path { flex: 1 1 260px; min-width: 160px; font-size: 12px; }
   #status { font-size: 12px; color: var(--text-color-muted, #656d76); width: 100%; }
   #doc { padding: 4px 20px 60vh; max-width: 900px; }
@@ -58,6 +59,7 @@
   <label>Voice <select id="voice"></select></label><span id="voiceNote" style="font-size:12px;color:var(--text-color-muted,#656d76)"></span>
   <label>Speed <input id="rate" type="range" min="0.5" max="2" step="0.1" value="1"><span id="rateVal">1.0x</span></label>
   <label><input id="skipCode" type="checkbox" checked> Skip code</label>
+  <select id="files" title="Markdown files in this session"></select>
   <input id="path" type="text" placeholder="Path to .md file" spellcheck="false">
   <button id="open" title="Load this path">Open</button>
   <button id="reload" title="Reload file">⟳</button>
@@ -73,6 +75,7 @@ let cur = -1;
 let state = "idle";   // idle | playing | paused
 let runId = 0;
 let lastContent = null;
+let lastVersion = null;
 
 // ---------- Markdown ----------
 function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
@@ -191,7 +194,9 @@ let onlineVoices = [];
 let piperVoiceList = [];
 let voiceInfo = "";
 const player = new Audio();
-const audioMemo = new Map(); // voice|text -> Promise<objectURL>
+const audioMemo = new Map(); // voice|text -> { p, done, urgent, ctrls[] }
+// First chunk of each block is kept short so audio starts quickly after a click/jump.
+const FIRST_CHUNK = 140;
 
 function localVoices() { return synth.getVoices(); }
 function selection() {
@@ -268,12 +273,21 @@ async function loadExtraVoices() {
   fillVoices();
 }
 
-function splitText(t, max) {
-  if (t.length <= max) return [t];
-  const parts = t.match(/[^.!?;:]+[.!?;:]*\s*/g) || [t];
+function splitText(t, max, firstMax = max) {
+  const sentences = t.match(/[^.!?;:]+[.!?;:]*\s*/g) || [t];
+  const parts = [];
+  for (const s of sentences) {
+    if (s.length <= firstMax) { parts.push(s); continue; }
+    // break over-long sentences at commas, then at word boundaries
+    for (const c of s.match(/[^,]+,?\s*/g) || [s]) {
+      if (c.length <= firstMax) parts.push(c);
+      else parts.push(...(c.match(new RegExp(`.{1,${firstMax}}(\\s+|$)|\\S+`, "g")) || [c]));
+    }
+  }
   const out = []; let buf = "";
   for (const p of parts) {
-    if ((buf + p).length > max && buf) { out.push(buf); buf = ""; }
+    const lim = out.length ? max : firstMax;
+    if (buf && (buf + p).length > lim) { out.push(buf); buf = ""; }
     buf += p;
   }
   if (buf.trim()) out.push(buf);
@@ -283,8 +297,11 @@ function splitText(t, max) {
 function highlight(i) {
   document.querySelectorAll(".reading").forEach((e) => e.classList.remove("reading"));
   if (i >= 0 && blocks[i]) {
-    blocks[i].el.classList.add("reading");
-    blocks[i].el.scrollIntoView({ block: "center", behavior: "smooth" });
+    const el = blocks[i].el;
+    el.classList.add("reading");
+    const r = el.getBoundingClientRect();
+    const near = r.bottom > -window.innerHeight && r.top < 2 * window.innerHeight;
+    el.scrollIntoView({ block: "center", behavior: near ? "smooth" : "auto" });
   }
 }
 
@@ -305,19 +322,51 @@ function nextIndex(idx) {
   return idx;
 }
 
-function fetchAudio(voice, text) {
+function requestAudio(voice, text, urgent, entry) {
+  const ctrl = new AbortController();
+  entry.ctrls.push(ctrl);
+  return fetch("/tts", { method: "POST", body: JSON.stringify({ voice, text, urgent }), signal: ctrl.signal })
+    .then(async (r) => {
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "HTTP " + r.status);
+      return URL.createObjectURL(await r.blob());
+    });
+}
+
+// urgent = the listener is waiting for this chunk right now; otherwise it's a prefetch.
+function fetchAudio(voice, text, urgent) {
   const key = voice + "|" + text;
-  if (!audioMemo.has(key)) {
-    const p = fetch("/tts", { method: "POST", body: JSON.stringify({ voice, text }) })
-      .then(async (r) => {
-        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "HTTP " + r.status);
-        return URL.createObjectURL(await r.blob());
-      });
-    p.catch(() => audioMemo.delete(key));
-    audioMemo.set(key, p);
-    if (audioMemo.size > 60) audioMemo.delete(audioMemo.keys().next().value);
+  let e = audioMemo.get(key);
+  if (e && urgent && !e.urgent && !e.done) {
+    // upgrade a queued prefetch: the server joins the same job and moves it to the front
+    e.urgent = true;
+    e.p = requestAudio(voice, text, true, e);
+    track(key, e);
   }
-  return audioMemo.get(key);
+  if (!e) {
+    e = { done: false, urgent: !!urgent, ctrls: [] };
+    e.p = requestAudio(voice, text, !!urgent, e);
+    audioMemo.set(key, e);
+    track(key, e);
+    if (audioMemo.size > 60) {
+      for (const [k, v] of audioMemo) {
+        if (audioMemo.size <= 60) break;
+        if (v.done) { audioMemo.delete(k); v.p.then((u) => URL.revokeObjectURL(u)).catch(() => {}); }
+      }
+    }
+  }
+  return e.p;
+}
+function track(key, e) {
+  const p = e.p;
+  p.then(() => { if (e.p === p) e.done = true; }, () => { if (audioMemo.get(key) === e && e.p === p) audioMemo.delete(key); });
+}
+// Abort every request that hasn't finished yet so the server can drop its queued jobs.
+function cancelPendingAudio() {
+  for (const [k, e] of audioMemo) {
+    if (e.done) continue;
+    e.ctrls.forEach((c) => c.abort());
+    audioMemo.delete(k);
+  }
 }
 
 function speakFrom(i) {
@@ -325,17 +374,21 @@ function speakFrom(i) {
   const my = ++runId;
   const sel = selection();
   const audio = usesAudio(sel.engine);
+  if (audio) cancelPendingAudio();
   const vid = sel.engine + ":" + sel.id;
   const max = sel.engine === "edge" ? 600 : sel.engine === "piper" ? 350 : 220;
+  const first = audio ? Math.min(FIRST_CHUNK, max) : max;
+  const chunksOf = (idx) => splitText(blockText(idx), max, first);
   const step = (idx) => {
     if (my !== runId) return;
     idx = nextIndex(idx);
     if (idx >= blocks.length) { cur = -1; highlight(-1); setState("idle"); return; }
     cur = idx; highlight(idx); status();
-    const chunks = splitText(blockText(idx), max);
+    const chunks = chunksOf(idx);
     if (audio) {
+      fetchAudio(vid, chunks[0], true);
       const ni = nextIndex(idx + 1);
-      if (ni < blocks.length) fetchAudio(vid, splitText(blockText(ni), max)[0]);
+      if (ni < blocks.length) fetchAudio(vid, chunksOf(ni)[0], false);
     }
     let k = 0;
     const next = async () => {
@@ -343,10 +396,11 @@ function speakFrom(i) {
       if (k >= chunks.length) { step(idx + 1); return; }
       const text = chunks[k++];
       if (audio) {
-        if (k < chunks.length) fetchAudio(vid, chunks[k]);
         let url;
-        try { url = await fetchAudio(vid, text); }
-        catch (e) { if (my === runId) { stop(); status("Voice error: " + e.message); } return; }
+        const pending = fetchAudio(vid, text, true);
+        if (k < chunks.length) fetchAudio(vid, chunks[k], false);
+        try { url = await pending; }
+        catch (e) { if (my === runId && e.name !== "AbortError") { stop(); status("Voice error: " + e.message); } return; }
         if (my !== runId) return;
         player.src = url;
         player.playbackRate = parseFloat($("rate").value);
@@ -369,7 +423,7 @@ function speakFrom(i) {
   step(Math.max(0, i));
 }
 
-function stop() { runId++; synth.cancel(); player.pause(); cur = -1; highlight(-1); setState("idle"); }
+function stop() { runId++; synth.cancel(); player.pause(); cancelPendingAudio(); cur = -1; highlight(-1); setState("idle"); }
 function togglePlay() {
   const edge = usesAudio(selection().engine);
   if (state === "playing") { edge ? player.pause() : synth.pause(); setState("paused"); }
@@ -383,16 +437,48 @@ function jump(d) {
 
 // ---------- File ----------
 async function load(keepPos) {
-  const r = await fetch("/file", { cache: "no-store" });
+  const q = keepPos && lastVersion ? "?known=" + encodeURIComponent(lastVersion) : "";
+  const r = await fetch("/file" + q, { cache: "no-store" });
   const f = await r.json();
-  $("path").value = f.path;
-  if (!f.exists) { $("doc").innerHTML = "<p><em>File not found: " + esc(f.path) + "</em></p>"; blocks = []; status(); return; }
+  if (f.unchanged) return;
+  if (document.activeElement !== $("path")) $("path").value = f.path;
+  lastVersion = f.version || null;
+  if (!f.exists) { $("doc").innerHTML = "<p><em>File not found: " + esc(f.path) + "</em></p>"; blocks = []; lastContent = null; status(); return; }
   if (f.content === lastContent && keepPos) return;
   lastContent = f.content;
   const wasPlaying = state !== "idle";
   if (wasPlaying) stop();
   render(f.content);
   status("Loaded " + f.path.split(/[\\/]/).pop());
+  if (!keepPos) refreshFiles();
+}
+
+async function refreshFiles() {
+  try {
+    const r = await (await fetch("/files", { cache: "no-store" })).json();
+    const sel = $("files");
+    const sig = JSON.stringify([r.current, r.files.map((f) => f.path)]);
+    if (sel.dataset.sig === sig) return;
+    sel.dataset.sig = sig;
+    sel.innerHTML = "";
+    for (const f of r.files) {
+      const o = document.createElement("option");
+      o.value = f.path; o.textContent = f.name; o.title = f.path;
+      sel.appendChild(o);
+    }
+    sel.value = r.current;
+    sel.title = "Markdown files in " + r.root;
+  } catch {}
+}
+
+async function openPath(path, relative) {
+  const r = await fetch("/load", { method: "POST", body: JSON.stringify({ path, relative: !!relative }) });
+  const j = await r.json();
+  if (j.error) { status("Error: " + j.error); return; }
+  stop(); lastContent = null; lastVersion = null;
+  $("path").value = j.path;
+  await load();
+  window.scrollTo(0, 0);
 }
 
 // ---------- Wiring ----------
@@ -400,13 +486,11 @@ $("play").onclick = togglePlay;
 $("stop").onclick = stop;
 $("prev").onclick = () => jump(-1);
 $("next").onclick = () => jump(1);
-$("reload").onclick = () => { lastContent = null; load(); };
-$("open").onclick = async () => {
-  const r = await fetch("/load", { method: "POST", body: JSON.stringify({ path: $("path").value.trim().replace(/^"|"$/g, "") }) });
-  const j = await r.json();
-  if (j.error) { status("Error: " + j.error); return; }
-  stop(); lastContent = null; load();
-};
+$("reload").onclick = () => { lastContent = null; lastVersion = null; load(); };
+$("open").onclick = () => openPath($("path").value.trim().replace(/^"|"$/g, ""));
+$("files").onchange = () => openPath($("files").value);
+$("files").addEventListener("mousedown", refreshFiles);
+$("files").addEventListener("focus", refreshFiles);
 $("path").addEventListener("keydown", (e) => { if (e.key === "Enter") $("open").click(); });
 $("voice").onchange = () => {
   localStorage.setItem("pr.voice", $("voice").value);
@@ -424,12 +508,22 @@ $("rate").onchange = () => { if (state === "playing" && !usesAudio(selection().e
 $("skipCode").checked = localStorage.getItem("pr.skipCode") !== "0";
 $("skipCode").onchange = () => localStorage.setItem("pr.skipCode", $("skipCode").checked ? "1" : "0");
 $("doc").addEventListener("click", (e) => {
-  if (e.target.closest("a")) return;
+  const a = e.target.closest("a");
+  if (a) {
+    const href = a.getAttribute("href") || "";
+    const m = href.match(/^([^#?]+\.(md|markdown))(#.*)?$/i);
+    if (m && !/^[a-z][a-z0-9+.-]*:\/\//i.test(href)) {
+      e.preventDefault();
+      const p = decodeURIComponent(m[1]);
+      openPath(p, !/^([a-z]:[\\/]|[\\/])/i.test(p));
+    }
+    return;
+  }
   const el = e.target.closest("[data-i]");
   if (el) speakFrom(parseInt(el.dataset.i, 10));
 });
 document.addEventListener("keydown", (e) => {
-  if (e.target.tagName === "INPUT" && e.target.type === "text") return;
+  if ((e.target.tagName === "INPUT" && e.target.type === "text") || e.target.tagName === "SELECT") return;
   if (e.code === "Space") { e.preventDefault(); togglePlay(); }
   else if (e.key === "Escape") stop();
   else if (e.key === "ArrowDown" || e.key === "ArrowRight") { e.preventDefault(); jump(1); }
@@ -443,7 +537,7 @@ loadExtraVoices();
 const es = new EventSource("/events");
 es.onmessage = (ev) => {
   const m = JSON.parse(ev.data);
-  if (m.type === "reload") { stop(); lastContent = null; load(); }
+  if (m.type === "reload") { stop(); lastContent = null; lastVersion = null; load(); }
   else if (m.type === "play") { if (state !== "playing") togglePlay(); }
   else if (m.type === "stop") stop();
 };

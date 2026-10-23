@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { readFile, stat, mkdir, readdir } from "node:fs/promises";
 import { existsSync, createReadStream } from "node:fs";
-import { join, resolve, extname, dirname } from "node:path";
+import { join, resolve, extname, dirname, relative } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -117,7 +117,54 @@ function piperWorker(py) {
     return w;
 }
 
-let piperQueue = Promise.resolve();
+// Priority job queue for the single Piper worker. The chunk the listener is waiting for
+// ("urgent") jumps ahead of prefetches; jobs whose requests were all aborted are dropped
+// before they start, so clicking a far-away block doesn't wait behind stale work.
+const piperPending = [];
+const piperByFile = new Map();
+let piperRunning = false;
+let piperSeq = 0;
+
+function piperJob(model, text, file, urgent) {
+    let job = file ? piperByFile.get(file) : null;
+    if (!job) {
+        job = { model, text, file, urgent: !!urgent, waiters: 0, started: false, seq: piperSeq++ };
+        job.promise = new Promise((a, b) => { job.resolve = a; job.reject = b; });
+        job.promise.catch(() => {});
+        piperPending.push(job);
+        if (file) piperByFile.set(file, job);
+        setImmediate(pumpPiper);
+    } else if (urgent) {
+        job.urgent = true;
+    }
+    return job;
+}
+
+function dropPiperJob(job) {
+    const i = piperPending.indexOf(job);
+    if (i >= 0) piperPending.splice(i, 1);
+    if (job.file && piperByFile.get(job.file) === job) piperByFile.delete(job.file);
+    job.reject(new Error("cancelled"));
+}
+
+async function pumpPiper() {
+    if (piperRunning || !piperPending.length) return;
+    piperPending.sort((a, b) => (b.urgent - a.urgent) || (a.seq - b.seq));
+    const job = piperPending.shift();
+    job.started = true;
+    piperRunning = true;
+    try {
+        if (!(job.file && existsSync(job.file))) await piperSynthesize(job.model, job.text, job.file);
+        job.resolve();
+    } catch (e) {
+        job.reject(e);
+    } finally {
+        if (job.file && piperByFile.get(job.file) === job) piperByFile.delete(job.file);
+        piperRunning = false;
+        pumpPiper();
+    }
+}
+
 async function piperSynthesize(model, text, out) {
     const py = await findPython();
     if (!py) throw new Error("Python not found");
@@ -129,7 +176,7 @@ async function piperSynthesize(model, text, out) {
     return done;
 }
 
-async function synthesize(voice, text) {
+async function synthesize(voice, text, opts = {}) {
     if (!text || text.length > 3000) throw new Error("bad text");
     await mkdir(CACHE_DIR, { recursive: true });
     const key = createHash("sha1").update(`${voice}|${text}`).digest("hex");
@@ -151,27 +198,69 @@ async function synthesize(voice, text) {
         if (!existsSync(model)) throw new Error("Piper voice not found: " + id);
         const file = join(CACHE_DIR, key + ".wav");
         if (!existsSync(file)) {
-            // serialize requests: the worker handles one at a time anyway
-            const job = piperQueue.then(() => existsSync(file) ? null : piperSynthesize(model, text, file));
-            piperQueue = job.catch(() => {});
-            await job;
+            const job = piperJob(model, text, file, opts.urgent);
+            job.waiters++;
+            let released = false;
+            const release = () => {
+                if (released) return;
+                released = true;
+                job.waiters--;
+                if (!job.started && job.waiters <= 0) dropPiperJob(job);
+            };
+            if (opts.onCancel) opts.onCancel(release);
+            try { await job.promise; } finally { release(); }
         }
         return { file, type: "audio/wav" };
     }
     throw new Error("bad voice");
 }
 
-function defaultPath(sessionId) {
-    return join(COPILOT_HOME, "session-state", sessionId, "plan.md");
+function sessionDir(sessionId) {
+    return join(COPILOT_HOME, "session-state", sessionId);
 }
 
-function resolveMd(p, sessionId) {
-    const full = resolve(p || defaultPath(sessionId));
+function defaultPath(sessionId) {
+    return join(sessionDir(sessionId), "plan.md");
+}
+
+function resolveMd(p, sessionId, base) {
+    const full = base ? resolve(base, p || "") : resolve(p || defaultPath(sessionId));
     const ext = extname(full).toLowerCase();
     if (![".md", ".markdown", ".txt"].includes(ext)) {
         throw new CanvasError("unsupported_file", "Only .md, .markdown or .txt files are supported.");
     }
     return full;
+}
+
+// Markdown files in the session folder (recursive, bounded).
+async function listSessionFiles(sessionId, current) {
+    const root = sessionDir(sessionId);
+    const out = [];
+    const walk = async (dir, depth) => {
+        if (depth > 4 || out.length >= 500) return;
+        let items = [];
+        try { items = await readdir(dir, { withFileTypes: true }); } catch { return; }
+        for (const it of items) {
+            if (it.name.startsWith(".") || it.name === "node_modules") continue;
+            const full = join(dir, it.name);
+            if (it.isDirectory()) await walk(full, depth + 1);
+            else if (/\.(md|markdown)$/i.test(it.name)) out.push(full);
+        }
+    };
+    await walk(root, 0);
+    const files = out.map((p) => ({ path: p, name: relative(root, p) }));
+    if (current && !files.some((f) => f.path.toLowerCase() === current.toLowerCase())) {
+        files.push({ path: current, name: current, external: true });
+    }
+    const rank = (f) => (f.name.toLowerCase() === "plan.md" ? 0 : f.external ? 2 : 1);
+    files.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+    return { root, files };
+}
+
+async function readJson(req) {
+    let body = "";
+    for await (const c of req) body += c;
+    return JSON.parse(body || "{}");
 }
 
 function broadcast(entry, msg) {
@@ -187,11 +276,22 @@ async function startServer(entry) {
                 res.setHeader("Content-Type", "text/html; charset=utf-8");
                 res.end(await readFile(join(HERE, "ui.html"), "utf8"));
             } else if (url.pathname === "/file") {
-                const exists = existsSync(entry.path);
-                const content = exists ? await readFile(entry.path, "utf8") : "";
+                let st = null;
+                try { st = await stat(entry.path); } catch {}
+                const mtime = st ? `${st.mtimeMs}:${st.size}` : "";
                 res.setHeader("Content-Type", "application/json; charset=utf-8");
                 res.setHeader("Cache-Control", "no-store");
-                res.end(JSON.stringify({ path: entry.path, exists, content }));
+                const known = url.searchParams.get("known");
+                if (st && known && known === `${entry.path}|${mtime}`) {
+                    res.end(JSON.stringify({ path: entry.path, unchanged: true }));
+                    return;
+                }
+                const content = st ? await readFile(entry.path, "utf8") : "";
+                res.end(JSON.stringify({ path: entry.path, exists: !!st, content, version: `${entry.path}|${mtime}` }));
+            } else if (url.pathname === "/files") {
+                res.setHeader("Content-Type", "application/json; charset=utf-8");
+                res.setHeader("Cache-Control", "no-store");
+                res.end(JSON.stringify({ current: entry.path, ...(await listSessionFiles(entry.sessionId, entry.path)) }));
             } else if (url.pathname === "/events") {
                 res.writeHead(200, {
                     "Content-Type": "text/event-stream",
@@ -206,28 +306,26 @@ async function startServer(entry) {
                 res.setHeader("Content-Type", "application/json; charset=utf-8");
                 res.end(JSON.stringify({ edge, piper: piperV }));
             } else if (url.pathname === "/tts" && req.method === "POST") {
-                let body = "";
-                for await (const c of req) body += c;
-                const { voice, text } = JSON.parse(body || "{}");
-                const { file, type } = await synthesize(String(voice), String(text));
+                const { voice, text, urgent } = await readJson(req);
+                let cancel = null;
+                res.on("close", () => { if (!res.writableFinished && cancel) cancel(); });
+                const { file, type } = await synthesize(String(voice), String(text), {
+                    urgent: !!urgent,
+                    onCancel: (fn) => { cancel = fn; if (res.destroyed) fn(); },
+                });
+                if (res.destroyed) return;
                 res.setHeader("Content-Type", type);
                 createReadStream(file).pipe(res);
             } else if (url.pathname === "/warm" && req.method === "POST") {
-                let body = "";
-                for await (const c of req) body += c;
-                const { voice } = JSON.parse(body || "{}");
+                const { voice } = await readJson(req);
                 const id = String(voice || "").replace(/^piper:/, "");
                 const model = join(PIPER_DIR, id + ".onnx");
-                if (/^[A-Za-z0-9_.-]+$/.test(id) && existsSync(model)) {
-                    piperQueue = piperQueue.then(() => piperSynthesize(model, "", null)).catch(() => {});
-                }
+                if (/^[A-Za-z0-9_.-]+$/.test(id) && existsSync(model)) piperJob(model, "", null, false);
                 res.setHeader("Content-Type", "application/json");
                 res.end("{}");
             } else if (url.pathname === "/load" && req.method === "POST") {
-                let body = "";
-                for await (const c of req) body += c;
-                const { path } = JSON.parse(body || "{}");
-                entry.path = resolveMd(path, entry.sessionId);
+                const { path, relative: rel } = await readJson(req);
+                entry.path = resolveMd(path, entry.sessionId, rel ? dirname(entry.path) : undefined);
                 res.setHeader("Content-Type", "application/json");
                 res.end(JSON.stringify({ path: entry.path }));
             } else {
@@ -277,6 +375,14 @@ const canvas = createCanvas({
                 e.path = resolveMd(ctx.input?.path, ctx.sessionId);
                 broadcast(e, { type: "reload" });
                 return { path: e.path, exists: existsSync(e.path) };
+            },
+        },
+        {
+            name: "list",
+            description: "List markdown files in this session's folder that can be loaded.",
+            handler: async (ctx) => {
+                const e = instances.get(ctx.instanceId);
+                return await listSessionFiles(ctx.sessionId, e?.path);
             },
         },
         {

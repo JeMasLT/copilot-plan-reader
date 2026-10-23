@@ -3,13 +3,15 @@
 Renders a markdown file (default: the current session's `plan.md`) in a side panel and reads it aloud.
 
 - Play / Pause / Stop, previous/next block, click any paragraph to start there
+- File picker listing every `.md` file in the session folder (recursive). Relative `.md` links in the document open in the reader.
 - Highlights the block being read; Space, Esc and arrow keys work as shortcuts
-- Speed 0.5–2x, optional skipping of code blocks, auto-reload when the file changes
+- Speed 0.5–2x, optional skipping of code blocks, auto-reload when the file changes (cheap mtime check, no full re-download)
+- Fast jumps: the first chunk of each block is short, the chunk you're waiting for is synthesized before queued prefetches, and stale prefetches are cancelled when you click elsewhere
 - Voices (English US/UK and Lithuanian only):
   - **Windows voices**, offline, built in, no setup needed
   - **Piper**, offline natural voices: Lessac (US), Alba (UK), **Ingutė and Reginutė (Lithuanian)**. Needs `setup.ps1`.
   - **Edge online voices**, natural (Lithuanian Ona/Leonas plus US/UK English), needs `setup.ps1`. The text is sent to Microsoft's read-aloud service.
-- Agent actions: `load { path }`, `play`, `stop`
+- Agent actions: `load { path }`, `list`, `play`, `stop`
 
 ## Install
 
