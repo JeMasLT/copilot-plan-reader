@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { readFile, stat, mkdir, readdir } from "node:fs/promises";
+import { readFile, stat, mkdir, readdir, writeFile } from "node:fs/promises";
 import { existsSync, createReadStream } from "node:fs";
 import { join, resolve, extname, dirname, relative } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -254,7 +254,47 @@ async function listSessionFiles(sessionId, current) {
     }
     const rank = (f) => (f.name.toLowerCase() === "plan.md" ? 0 : f.external ? 2 : 1);
     files.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
-    return { root, files };
+    const recent = (await readRecent()).filter((p) => !files.some((f) => f.path.toLowerCase() === p.toLowerCase()) && existsSync(p));
+    return { root, files, recent: recent.map((p) => ({ path: p, name: p.split(/[\\/]/).slice(-2).join("\\") })) };
+}
+
+// Recently opened files (user-global, outside git: artifacts/ is ignored).
+const RECENT_FILE = join(HERE, "artifacts", "recent.json");
+async function readRecent() {
+    try { return JSON.parse(await readFile(RECENT_FILE, "utf8")); } catch { return []; }
+}
+async function addRecent(p) {
+    if (!p || p.toLowerCase().includes(`${join(COPILOT_HOME, "session-state").toLowerCase()}`)) return;
+    const list = [p, ...(await readRecent()).filter((x) => x.toLowerCase() !== p.toLowerCase())].slice(0, 15);
+    try {
+        await mkdir(dirname(RECENT_FILE), { recursive: true });
+        await writeFile(RECENT_FILE, JSON.stringify(list, null, 1));
+    } catch {}
+}
+
+// Native Windows "Open file" dialog, shown on top of the app.
+const BROWSE_PS = `
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false; WindowState = 'Minimized' }
+$d = New-Object System.Windows.Forms.OpenFileDialog
+$d.Title = 'Open markdown file in Plan Reader'
+$d.Filter = 'Markdown (*.md;*.markdown)|*.md;*.markdown|Text (*.txt)|*.txt|All files (*.*)|*.*'
+if ($env:PR_INITIAL_DIR -and (Test-Path -LiteralPath $env:PR_INITIAL_DIR)) { $d.InitialDirectory = $env:PR_INITIAL_DIR }
+if ($d.ShowDialog($owner) -eq 'OK') { [Console]::OutputEncoding = [Text.Encoding]::UTF8; [Console]::Out.Write($d.FileName) }
+`;
+let browsing = null;
+function browseForFile(initialDir) {
+    if (browsing) return browsing;
+    browsing = new Promise((res) => {
+        const p = spawn("powershell.exe", ["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-EncodedCommand",
+            Buffer.from(BROWSE_PS, "utf16le").toString("base64")],
+            { windowsHide: false, env: { ...process.env, PR_INITIAL_DIR: initialDir || "" } });
+        let out = "";
+        p.stdout.on("data", (d) => (out += d));
+        p.on("error", () => res(null));
+        p.on("close", () => res(out.trim() || null));
+    }).finally(() => { browsing = null; });
+    return browsing;
 }
 
 async function readJson(req) {
@@ -292,6 +332,13 @@ async function startServer(entry) {
                 res.setHeader("Content-Type", "application/json; charset=utf-8");
                 res.setHeader("Cache-Control", "no-store");
                 res.end(JSON.stringify({ current: entry.path, ...(await listSessionFiles(entry.sessionId, entry.path)) }));
+            } else if (url.pathname === "/browse" && req.method === "POST") {
+                const picked = await browseForFile(dirname(entry.path));
+                res.setHeader("Content-Type", "application/json; charset=utf-8");
+                if (!picked) { res.end(JSON.stringify({ cancelled: true })); return; }
+                entry.path = resolveMd(picked, entry.sessionId);
+                addRecent(entry.path);
+                res.end(JSON.stringify({ path: entry.path }));
             } else if (url.pathname === "/events") {
                 res.writeHead(200, {
                     "Content-Type": "text/event-stream",
@@ -326,6 +373,7 @@ async function startServer(entry) {
             } else if (url.pathname === "/load" && req.method === "POST") {
                 const { path, relative: rel } = await readJson(req);
                 entry.path = resolveMd(path, entry.sessionId, rel ? dirname(entry.path) : undefined);
+                if (existsSync(entry.path)) addRecent(entry.path);
                 res.setHeader("Content-Type", "application/json");
                 res.end(JSON.stringify({ path: entry.path }));
             } else {
@@ -373,6 +421,7 @@ const canvas = createCanvas({
             handler: async (ctx) => {
                 const e = getEntry(ctx.instanceId);
                 e.path = resolveMd(ctx.input?.path, ctx.sessionId);
+                if (existsSync(e.path)) addRecent(e.path);
                 broadcast(e, { type: "reload" });
                 return { path: e.path, exists: existsSync(e.path) };
             },
@@ -407,6 +456,7 @@ const canvas = createCanvas({
     open: async (ctx) => {
         let entry = instances.get(ctx.instanceId);
         const path = resolveMd(ctx.input?.path, ctx.sessionId);
+        if (ctx.input?.path && existsSync(path)) addRecent(path);
         if (!entry) {
             entry = { path, sessionId: ctx.sessionId, clients: new Set() };
             await startServer(entry);

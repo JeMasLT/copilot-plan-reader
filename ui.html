@@ -60,6 +60,7 @@
   <label>Speed <input id="rate" type="range" min="0.5" max="2" step="0.1" value="1"><span id="rateVal">1.0x</span></label>
   <label><input id="skipCode" type="checkbox" checked> Skip code</label>
   <select id="files" title="Markdown files in this session"></select>
+  <button id="browse" title="Choose a markdown file on this PC">📂 Browse…</button>
   <input id="path" type="text" placeholder="Path to .md file" spellcheck="false">
   <button id="open" title="Load this path">Open</button>
   <button id="reload" title="Reload file">⟳</button>
@@ -457,15 +458,23 @@ async function refreshFiles() {
   try {
     const r = await (await fetch("/files", { cache: "no-store" })).json();
     const sel = $("files");
-    const sig = JSON.stringify([r.current, r.files.map((f) => f.path)]);
+    const sig = JSON.stringify([r.current, r.files.map((f) => f.path), (r.recent || []).map((f) => f.path)]);
     if (sel.dataset.sig === sig) return;
     sel.dataset.sig = sig;
     sel.innerHTML = "";
-    for (const f of r.files) {
-      const o = document.createElement("option");
-      o.value = f.path; o.textContent = f.name; o.title = f.path;
-      sel.appendChild(o);
-    }
+    const group = (label, list) => {
+      if (!list.length) return;
+      const g = document.createElement("optgroup");
+      g.label = label;
+      for (const f of list) {
+        const o = document.createElement("option");
+        o.value = f.path; o.textContent = f.name; o.title = f.path;
+        g.appendChild(o);
+      }
+      sel.appendChild(g);
+    };
+    group("This session", r.files);
+    group("Recent", r.recent || []);
     sel.value = r.current;
     sel.title = "Markdown files in " + r.root;
   } catch {}
@@ -488,6 +497,20 @@ $("prev").onclick = () => jump(-1);
 $("next").onclick = () => jump(1);
 $("reload").onclick = () => { lastContent = null; lastVersion = null; load(); };
 $("open").onclick = () => openPath($("path").value.trim().replace(/^"|"$/g, ""));
+$("browse").onclick = async () => {
+  const b = $("browse");
+  b.disabled = true; status("Choose a file in the Windows dialog…");
+  try {
+    const j = await (await fetch("/browse", { method: "POST" })).json();
+    if (j.error) { status("Error: " + j.error); return; }
+    if (j.cancelled) { status(); return; }
+    stop(); lastContent = null; lastVersion = null;
+    $("path").value = j.path;
+    await load();
+    refreshFiles();
+    window.scrollTo(0, 0);
+  } finally { b.disabled = false; }
+};
 $("files").onchange = () => openPath($("files").value);
 $("files").addEventListener("mousedown", refreshFiles);
 $("files").addEventListener("focus", refreshFiles);

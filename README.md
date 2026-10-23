@@ -3,7 +3,8 @@
 Renders a markdown file (default: the current session's `plan.md`) in a side panel and reads it aloud.
 
 - Play / Pause / Stop, previous/next block, click any paragraph to start there
-- File picker listing every `.md` file in the session folder (recursive). Relative `.md` links in the document open in the reader.
+- File picker listing every `.md` file in the session folder (recursive), plus your 15 most recently opened files. Relative `.md` links in the document open in the reader.
+- **📂 Browse…** opens the Windows "Open file" dialog so you can load any markdown file on the PC.
 - Highlights the block being read; Space, Esc and arrow keys work as shortcuts
 - Speed 0.5–2x, optional skipping of code blocks, auto-reload when the file changes (cheap mtime check, no full re-download)
 - Fast jumps: the first chunk of each block is short, the chunk you're waiting for is synthesized before queued prefetches, and stale prefetches are cancelled when you click elsewhere
