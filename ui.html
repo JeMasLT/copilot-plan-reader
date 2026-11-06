@@ -64,6 +64,7 @@
   <input id="path" type="text" placeholder="Path to .md file" spellcheck="false">
   <button id="open" title="Load this path">Open</button>
   <button id="reload" title="Reload file">⟳</button>
+  <button id="popout" title="Open in a separate window (no address bar)">⧉ Pop out</button>
   <div id="status"></div>
 </div>
 <div id="doc"></div>
@@ -510,6 +511,19 @@ $("browse").onclick = async () => {
     refreshFiles();
     window.scrollTo(0, 0);
   } finally { b.disabled = false; }
+};
+if (new URLSearchParams(location.search).has("popout")) $("popout").hidden = true;
+$("popout").onclick = async () => {
+  const w = Math.max(window.outerWidth || 0, 1100), h = Math.max(window.outerHeight || 0, 900);
+  let ok = false;
+  try {
+    ok = (await (await fetch("/popout", { method: "POST", body: JSON.stringify({ width: w, height: h }) })).json()).ok;
+  } catch {}
+  if (!ok) {
+    const win = window.open(location.origin + "/?popout=1", "plan-reader-popout",
+      `popup=yes,width=${w},height=${h},toolbar=no,location=no,menubar=no,status=no,resizable=yes,scrollbars=yes`);
+    if (!win) status("Pop-out blocked: no Edge/Chrome found and popup was blocked.");
+  }
 };
 $("files").onchange = () => openPath($("files").value);
 $("files").addEventListener("mousedown", refreshFiles);

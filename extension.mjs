@@ -333,6 +333,43 @@ function browseForFile(initialDir) {
     return browsing;
 }
 
+function findAppBrowser() {
+    if (process.platform === "win32") {
+        const roots = [process.env["ProgramFiles(x86)"], process.env.ProgramFiles, process.env.LOCALAPPDATA].filter(Boolean);
+        const rels = ["Microsoft\\Edge\\Application\\msedge.exe", "Google\\Chrome\\Application\\chrome.exe"];
+        for (const rel of rels) for (const root of roots) {
+            const p = join(root, rel);
+            if (existsSync(p)) return { cmd: p, pre: [] };
+        }
+        return null;
+    }
+    if (process.platform === "darwin") {
+        for (const app of ["Microsoft Edge", "Google Chrome"]) {
+            if (existsSync(`/Applications/${app}.app`)) return { cmd: "open", pre: ["-na", app, "--args"] };
+        }
+        return null;
+    }
+    for (const name of ["microsoft-edge", "google-chrome", "chromium", "chromium-browser"]) {
+        for (const dir of (process.env.PATH || "").split(":")) {
+            const p = join(dir, name);
+            if (existsSync(p)) return { cmd: p, pre: [] };
+        }
+    }
+    return null;
+}
+
+// Open the reader in a chromeless browser window (no address bar / bookmarks) via --app mode.
+function popOut(url, width, height) {
+    const b = findAppBrowser();
+    if (!b) return false;
+    const w = Math.max(400, Math.min(4000, Number(width) || 1100));
+    const h = Math.max(300, Math.min(3000, Number(height) || 900));
+    const proc = spawn(b.cmd, [...b.pre, `--app=${url}`, `--window-size=${w},${h}`], { detached: true, stdio: "ignore" });
+    proc.on("error", () => {});
+    proc.unref();
+    return true;
+}
+
 async function readJson(req) {
     let body = "";
     for await (const c of req) body += c;
@@ -376,6 +413,11 @@ async function startServer(entry) {
                 entry.path = resolveMd(picked, entry.sessionId);
                 addRecent(entry.path);
                 res.end(JSON.stringify({ path: entry.path }));
+            } else if (url.pathname === "/popout" && req.method === "POST") {
+                const { width, height } = await readJson(req);
+                const ok = popOut(entry.url + "?popout=1", width, height);
+                res.setHeader("Content-Type", "application/json");
+                res.end(JSON.stringify({ ok }));
             } else if (url.pathname === "/events") {
                 res.writeHead(200, {
                     "Content-Type": "text/event-stream",
