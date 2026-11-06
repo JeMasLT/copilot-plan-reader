@@ -15,6 +15,12 @@ import os
 import sys
 import wave
 
+# The extension writes UTF-8 JSON; on Windows pipes default to the ANSI code page
+# (e.g. cp1257), which would turn "č", "š", "—" into mojibake before synthesis.
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 try:
     from piper import PiperVoice
 except ImportError:
