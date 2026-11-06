@@ -59,6 +59,7 @@
   <label>Voice <select id="voice"></select></label><span id="voiceNote" style="font-size:12px;color:var(--text-color-muted,#656d76)"></span>
   <label>Speed <input id="rate" type="range" min="0.5" max="2" step="0.1" value="1"><span id="rateVal">1.0x</span></label>
   <label><input id="skipCode" type="checkbox" checked> Skip code</label>
+  <label title="Don't read `inline code` spans"><input id="skipInline" type="checkbox"> Skip `code`</label>
   <select id="files" title="Markdown files in this session"></select>
   <button id="browse" title="Choose a markdown file on this PC">📂 Browse…</button>
   <input id="path" type="text" placeholder="Path to .md file" spellcheck="false">
@@ -93,7 +94,7 @@ function speakable(s) {
   return s
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
+    .replace(/`([^`]+)`/g, "\u0001$1\u0002") // mark inline code so it can be skipped at speak time
     .replace(/(\*\*|__|\*|_|~~)/g, "")
     .replace(/^#+\s*/, "")
     .replace(/<[^>]+>/g, "")
@@ -318,9 +319,22 @@ function status(extra) {
   $("status").textContent = [extra, pos, state !== "idle" ? state : ""].filter(Boolean).join(" · ");
 }
 
-function blockText(idx) { const b = blocks[idx]; return b.isCode ? "Code block." : b.text; }
+function stripInline(t, skip) {
+  if (!skip) return t.replace(/[\u0001\u0002]/g, "");
+  return t.replace(/\u0001[^\u0002]*\u0002/g, "")
+    .replace(/\(\s*\)|\[\s*\]/g, "")
+    .replace(/\s+([,.;:!?)])/g, "$1")
+    .replace(/([,;:])(\s*[,;:])+/g, "$1")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s,;:]+/, "")
+    .trim();
+}
+function blockText(idx) {
+  const b = blocks[idx];
+  return b.isCode ? "Code block." : stripInline(b.text, $("skipInline").checked);
+}
 function nextIndex(idx) {
-  while (idx < blocks.length && $("skipCode").checked && blocks[idx].isCode) idx++;
+  while (idx < blocks.length && (($("skipCode").checked && blocks[idx].isCode) || !blockText(idx))) idx++;
   return idx;
 }
 
@@ -544,6 +558,8 @@ $("rate").oninput = () => {
 $("rate").onchange = () => { if (state === "playing" && !usesAudio(selection().engine)) speakFrom(cur); };
 $("skipCode").checked = localStorage.getItem("pr.skipCode") !== "0";
 $("skipCode").onchange = () => localStorage.setItem("pr.skipCode", $("skipCode").checked ? "1" : "0");
+$("skipInline").checked = localStorage.getItem("pr.skipInline") === "1";
+$("skipInline").onchange = () => localStorage.setItem("pr.skipInline", $("skipInline").checked ? "1" : "0");
 $("doc").addEventListener("click", (e) => {
   const a = e.target.closest("a");
   if (a) {

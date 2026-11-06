@@ -7,7 +7,7 @@ Renders a markdown file (default: the current session's `plan.md`) in a side pan
 - **📂 Browse…** opens the Windows "Open file" dialog so you can load any markdown file on the PC.
 - **⧉ Pop out** opens the reader in its own window with no address bar or bookmarks (Edge/Chrome `--app` mode). It falls back to a browser popup if neither is installed.
 - Highlights the block being read; Space, Esc and arrow keys work as shortcuts
-- Speed 0.5–2x, optional skipping of code blocks, auto-reload when the file changes (cheap mtime check, no full re-download)
+- Speed 0.5–2x, optional skipping of code blocks and of inline `` `code` `` spans, auto-reload when the file changes (cheap mtime check, no full re-download)
 - Fast jumps: the first chunk of each block is short, the chunk you're waiting for is synthesized before queued prefetches, and stale prefetches are cancelled when you click elsewhere
 - Voices (English US/UK and Lithuanian only):
   - **Windows voices**, offline, built in, no setup needed
